@@ -1,0 +1,7 @@
+# Generated PKI material - never commit private keys
+pki/
+*.key.pem
+*.pem
+*.csr
+*.sig
+data*.txt
