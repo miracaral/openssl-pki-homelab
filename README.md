@@ -29,7 +29,7 @@ Homelab Root CA (RSA 4096, 20y)
 Requires Linux or macOS with **OpenSSL 3.x** (`openssl version`).
 
 ```bash
-git clone https://github.com/<you>/openssl-pki-homelab.git
+git clone https://github.com/miracaral/openssl-pki-homelab.git
 cd openssl-pki-homelab
 ./make-pki.sh            # asks for a CA pass phrase, builds ./pki
 ./mtls-demo.sh           # starts an mTLS server on :8443 and tests 4 clients
