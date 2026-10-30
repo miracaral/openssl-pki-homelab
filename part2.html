@@ -1,0 +1,184 @@
+<p>In <a href="https://medium.com/@mmirac.aral/building-a-pki-with-openssl-part-1-rsa-key-pair-5a40c4c69cdd">Part 1</a> I generated an RSA key pair. In this part I turn keys into a working PKI: a Root CA, two intermediate CAs (one RSA, one ECC), server and user certificates, a signed document verified through the chain, and a revoked certificate caught by a CRL. Everything runs on Kali Linux with OpenSSL 3.x.</p>
+<h3>What we are building</h3>
+<p>This is the hierarchy we end up with:</p>
+<pre>Homelab Root CA (RSA 4096, 20 years)
+├── www.homelab.test (server, RSA 2048, 375 days)
+├── Homelab Intermediate CA (RSA 4096, 10 years, pathlen:0)
+│   ├── Homelab User (RSA 2048, 375 days)
+│   └── Revoked Test User (RSA 2048, revoked: keyCompromise)
+└── Homelab Intermediate CA 2 ECC (P-384, 10 years, pathlen:0)
+    └── Homelab ECC User (P-256, 375 days)</pre>
+<p>Everything below runs as root, because the CA directories live under <code>/root</code>:</p>
+<pre>sudo -i</pre>
+<h3>Step 1: The Root CA</h3>
+<p>A Certificate Authority signs other people's public keys. Everything in the PKI is trusted only because the root is trusted, so the root gets the strongest key and the strictest permissions.</p>
+<h4>Directory layout</h4>
+<pre>mkdir -p /root/ca &amp;&amp; cd /root/ca
+mkdir certs crl newcerts private
+chmod 700 private
+touch index.txt
+echo 1000 &gt; serial
+echo 1000 &gt; crlnumber</pre>
+<ul>
+<li><code>index.txt</code> is the CA's database of every certificate it issued.</li>
+<li><code>serial</code> holds the next serial number; <code>crlnumber</code> numbers the revocation lists.</li>
+<li><code>private/</code> is 700 because the root private key lives there.</li>
+</ul>
+<h4>The config file</h4>
+<p>I started from the widely used sample <code>openssl.cnf</code> from Jamie Nguyen's <em>OpenSSL Certificate Authority</em> guide and changed what did not fit my setup:</p>
+<pre>sed -i 's/^countryName_default.*/countryName_default = CZ/; s/^stateOrProvinceName_default.*/stateOrProvinceName_default = Prague/; s/^0\.organizationName_default.*/0.organizationName_default = Homelab/; s/^default_bits.*/default_bits = 4096/; /^nsCertType/d; /^nsComment/d' openssl.cnf</pre>
+<ul>
+<li>The sample defaults (GB, England, Alice Ltd) became my real values.</li>
+<li><code>default_bits</code> went from 2048 to 4096 to match the key size used for CAs.</li>
+<li>The <code>nsCertType</code> and <code>nsComment</code> lines are Netscape-era extensions that modern clients ignore, so I removed them.</li>
+</ul>
+<p>The root uses <code>policy_strict</code>: it only signs requests whose country, state and organization match its own. Keep that in mind for Step 3.</p>
+<h4>Root key and self-signed certificate</h4>
+<pre>openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -aes-256-cbc -out private/ca.key.pem
+chmod 400 private/ca.key.pem
+
+openssl req -config openssl.cnf -key private/ca.key.pem -new -x509 -days 7300 -sha256 -extensions v3_ca -out certs/ca.cert.pem
+chmod 444 certs/ca.cert.pem</pre>
+<p>For the Common Name I entered <code>Homelab Root CA</code>. Then inspect it:</p>
+<pre>openssl x509 -noout -text -in certs/ca.cert.pem</pre>
+<p>What to check in the output:</p>
+<ul>
+<li><code>Issuer</code> and <code>Subject</code> are identical. That is what self-signed means.</li>
+<li><code>Public-Key: (4096 bit)</code> and <code>sha256WithRSAEncryption</code></li>
+<li>Validity of 20 years</li>
+<li><code>X509v3 Basic Constraints: critical, CA:TRUE</code></li>
+</ul>
+<figure><img src="https://raw.githubusercontent.com/miracaral/openssl-pki-homelab/media/01-root-ca.jpg"><figcaption>The self-signed root certificate: Issuer and Subject match, 4096-bit key, 20-year validity</figcaption></figure>
+<h3>Step 2: A CSR and a server certificate</h3>
+<p>A Certificate Signing Request (CSR) carries a public key and the identity it should be bound to. The CA checks it and returns a signed certificate.</p>
+<pre>cd /root/ca
+openssl req -new -newkey rsa:2048 -nodes -keyout private/server.key.pem -out server.csr -subj "/C=CZ/ST=Prague/O=Homelab/CN=www.homelab.test"
+chmod 400 private/server.key.pem
+openssl req -in server.csr -noout -text</pre>
+<ul>
+<li><code>-nodes</code> leaves the server key unencrypted, so a web server can start without someone typing a pass phrase.</li>
+<li>C, ST and O match the root, because <code>policy_strict</code> requires it.</li>
+</ul>
+<p>Sign it with the root:</p>
+<pre>openssl ca -config openssl.cnf -extensions server_cert -days 375 -notext -md sha256 -in server.csr -out certs/server.cert.pem</pre>
+<p>OpenSSL prints <code>Signature ok</code>, shows the details (<code>CA:FALSE</code>, <code>Digital Signature, Key Encipherment</code>, <code>TLS Web Server Authentication</code>), and asks twice for confirmation. Then verify:</p>
+<pre>openssl verify -CAfile certs/ca.cert.pem certs/server.cert.pem
+# certs/server.cert.pem: OK
+cat index.txt
+# V  271108160204Z  1000  unknown  /C=CZ/ST=Prague/O=Homelab/CN=www.homelab.test</pre>
+<p>The <code>V</code> means valid; <code>1000</code> is the serial number from the <code>serial</code> file.</p>
+<figure><img src="https://raw.githubusercontent.com/miracaral/openssl-pki-homelab/media/02-server-cert.jpg"><figcaption>Signing the server CSR, then verifying it against the root</figcaption></figure>
+<h3>Step 3: Root → Intermediate → User chain</h3>
+<p>In real PKIs the root rarely signs end-user certificates. It signs an intermediate CA, and the root key goes offline. If the intermediate is compromised, you revoke it and the root survives.</p>
+<h4>Intermediate CA directory and config</h4>
+<pre>mkdir -p /root/intermediate &amp;&amp; cd /root/intermediate
+mkdir certs crl newcerts private csr
+chmod 700 private
+touch index.txt
+echo 1000 &gt; serial
+echo 1000 &gt; crlnumber
+cp /root/ca/openssl.cnf openssl.cnf
+sed -i 's#^dir .*#dir = /root/intermediate#' openssl.cnf
+sed -i 's#ca\.key\.pem#intermediate.key.pem#' openssl.cnf
+sed -i 's#ca\.cert\.pem#intermediate.cert.pem#' openssl.cnf
+sed -i 's#ca\.crl\.pem#intermediate.crl.pem#' openssl.cnf
+sed -i 's#^policy .*#policy = policy_loose#' openssl.cnf</pre>
+<p>The intermediate uses <code>policy_loose</code>, so it can sign certificates for any organization.</p>
+<h4>Intermediate key, CSR and signature by the root</h4>
+<pre>openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -aes-256-cbc -out private/intermediate.key.pem
+chmod 400 private/intermediate.key.pem
+openssl req -config openssl.cnf -new -sha256 -key private/intermediate.key.pem -out csr/intermediate.csr.pem -subj "/C=CZ/ST=Prague/O=Homelab/CN=Homelab Intermediate CA"
+
+openssl ca -config /root/ca/openssl.cnf -extensions v3_intermediate_ca -days 3650 -notext -md sha256 -in csr/intermediate.csr.pem -out certs/intermediate.cert.pem
+chmod 444 certs/intermediate.cert.pem
+cat certs/intermediate.cert.pem /root/ca/certs/ca.cert.pem &gt; certs/ca-chain.cert.pem</pre>
+<p><code>v3_intermediate_ca</code> sets <code>CA:true, pathlen:0</code>: this CA may sign end-entity certificates but no further CAs.</p>
+<h4>User certificate signed by the intermediate</h4>
+<pre>openssl req -new -newkey rsa:2048 -nodes -keyout private/user.key.pem -out csr/user.csr.pem -subj "/C=CZ/ST=Prague/O=Homelab/CN=Homelab User"
+chmod 400 private/user.key.pem
+openssl ca -config openssl.cnf -extensions usr_cert -days 375 -notext -md sha256 -in csr/user.csr.pem -out certs/user.cert.pem</pre>
+<p>The <code>usr_cert</code> profile gives <code>TLS Web Client Authentication, E-mail Protection</code>.</p>
+<h4>Verify the chain</h4>
+<pre>openssl verify -CAfile /root/ca/certs/ca.cert.pem certs/intermediate.cert.pem
+# certs/intermediate.cert.pem: OK
+openssl verify -CAfile certs/ca-chain.cert.pem certs/user.cert.pem
+# certs/user.cert.pem: OK</pre>
+<p>Verification walks upward: the user cert is checked against the intermediate, the intermediate against the root, and the root is trusted.</p>
+<h3>Step 4: Signing data and verifying it through the chain</h3>
+<p>A digital signature is a hash of the data, transformed with the signer's private key. Anyone with the matching public key can check it. The certificate chain answers the remaining question: whose public key is this?</p>
+<pre>cd /root/intermediate
+echo "Signed by Homelab User" &gt; data.txt
+openssl dgst -sha256 -sign private/user.key.pem -out data.sig data.txt</pre>
+<p>The verifier first checks that the certificate itself is trustworthy, then takes the public key from it:</p>
+<pre>openssl verify -CAfile certs/ca-chain.cert.pem certs/user.cert.pem
+# certs/user.cert.pem: OK
+openssl x509 -in certs/user.cert.pem -pubkey -noout &gt; user.pub.pem
+openssl dgst -sha256 -verify user.pub.pem -signature data.sig data.txt
+# Verified OK</pre>
+<p>Now tamper with the data and check again:</p>
+<pre>echo "tampered" &gt;&gt; data.txt
+openssl dgst -sha256 -verify user.pub.pem -signature data.sig data.txt
+# Verification failure
+# ... rsa routines:ossl_rsa_verify:bad signature ...</pre>
+<p>One extra line breaks the signature. That gives integrity (the data did not change) and authenticity (it was signed by the holder of a certificate chaining to a trusted root).</p>
+<figure><img src="https://raw.githubusercontent.com/miracaral/openssl-pki-homelab/media/03-chain-and-sign.jpg"><figcaption>The chain verifies, the signature verifies, and one tampered line makes it fail</figcaption></figure>
+<h3>Step 5: An ECC intermediate, revocation and a CRL</h3>
+<p>For the final step I wanted something closer to a real deployment: at least two intermediates, revocation in at least one of them, and a mix of RSA and ECC keys.</p>
+<h4>Second intermediate with an ECC P-384 key</h4>
+<pre>mkdir -p /root/intermediate2 &amp;&amp; cd /root/intermediate2
+mkdir certs crl newcerts private csr &amp;&amp; chmod 700 private
+touch index.txt &amp;&amp; echo 1000 &gt; serial &amp;&amp; echo 1000 &gt; crlnumber
+cp /root/ca/openssl.cnf openssl.cnf
+# same five sed edits as in Step 3, with intermediate2 instead of intermediate
+
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -aes-256-cbc -out private/intermediate2.key.pem
+chmod 400 private/intermediate2.key.pem
+openssl req -config openssl.cnf -new -sha384 -key private/intermediate2.key.pem -out csr/intermediate2.csr.pem -subj "/C=CZ/ST=Prague/O=Homelab/CN=Homelab Intermediate CA 2 ECC"
+
+openssl ca -config /root/ca/openssl.cnf -extensions v3_intermediate_ca -days 3650 -notext -md sha256 -in csr/intermediate2.csr.pem -out certs/intermediate2.cert.pem
+cat certs/intermediate2.cert.pem /root/ca/certs/ca.cert.pem &gt; certs/ca-chain.cert.pem
+openssl verify -CAfile /root/ca/certs/ca.cert.pem certs/intermediate2.cert.pem</pre>
+<p>The RSA root can sign an ECC intermediate: the root's signature algorithm and the subject's key type are independent.</p>
+<h4>ECC user certificate</h4>
+<pre>openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout private/user2.key.pem -out csr/user2.csr.pem -subj "/C=CZ/ST=Prague/O=Homelab/CN=Homelab ECC User"
+chmod 400 private/user2.key.pem
+openssl ca -config openssl.cnf -extensions usr_cert -days 375 -notext -md sha256 -in csr/user2.csr.pem -out certs/user2.cert.pem
+openssl verify -CAfile certs/ca-chain.cert.pem certs/user2.cert.pem
+# certs/user2.cert.pem: OK</pre>
+<h4>Revoking a certificate and publishing a CRL</h4>
+<p>To keep the Step 4 user certificate valid, I issued a throwaway certificate from the RSA intermediate and revoked that one:</p>
+<pre>cd /root/intermediate
+openssl req -new -newkey rsa:2048 -nodes -keyout private/revokeme.key.pem -out csr/revokeme.csr.pem -subj "/C=CZ/ST=Prague/O=Homelab/CN=Revoked Test User"
+openssl ca -config openssl.cnf -extensions usr_cert -days 375 -notext -md sha256 -in csr/revokeme.csr.pem -out certs/revokeme.cert.pem
+
+openssl ca -config openssl.cnf -revoke certs/revokeme.cert.pem -crl_reason keyCompromise
+openssl ca -config openssl.cnf -gencrl -out crl/intermediate.crl.pem
+openssl crl -in crl/intermediate.crl.pem -noout -text</pre>
+<p>Revocation only marks the certificate as <code>R</code> in <code>index.txt</code>. Clients learn about it only from the CRL, which is why the second command matters. Now verify with CRL checking turned on:</p>
+<pre>openssl verify -crl_check -CAfile certs/ca-chain.cert.pem -CRLfile crl/intermediate.crl.pem certs/revokeme.cert.pem
+# error 23 at 0 depth lookup: certificate revoked
+cat index.txt</pre>
+<p>The certificate's signature and dates are still perfectly valid, yet it is rejected because the CA has withdrawn its trust.</p>
+<p>Here is the final layout on disk, split over two screenshots:</p>
+<figure><img src="https://raw.githubusercontent.com/miracaral/openssl-pki-homelab/media/04-tree-1.jpg"><figcaption>The root CA and the RSA intermediate</figcaption></figure>
+<figure><img src="https://raw.githubusercontent.com/miracaral/openssl-pki-homelab/media/05-tree-2.jpg"><figcaption>The ECC intermediate and the key pair from Part 1</figcaption></figure>
+<h3>Design choices</h3>
+<ul>
+<li><strong>Root CA:</strong> RSA 4096, AES-256 encrypted, 20 years, key file 400. The longest-lived key with the widest compatibility; it should be kept offline.</li>
+<li><strong>Intermediate CA:</strong> RSA 4096, AES-256 encrypted, 10 years, key file 400. Does the daily signing and can be revoked without touching the root; <code>pathlen:0</code>.</li>
+<li><strong>Intermediate CA 2:</strong> ECC P-384, AES-256 encrypted, 10 years, key file 400. About 192-bit security with a far smaller key than RSA, and it adds algorithm diversity.</li>
+<li><strong>Server:</strong> RSA 2048, unencrypted, 375 days, key file 400. Short-lived and unencrypted so the service can start unattended.</li>
+<li><strong>Users:</strong> RSA 2048 or ECC P-256, unencrypted, 375 days, key file 400. 112 or 128-bit security is plenty for a one-year certificate.</li>
+</ul>
+<p>Two rules sit behind these choices. A child certificate never outlives its issuer. And every private key is readable only by root, while certificates are public (444).</p>
+<p>For this walkthrough I reused one pass phrase for all CA keys. In a real PKI, each CA key gets its own strong pass phrase, and the root key lives on offline storage or an HSM.</p>
+<h3>Mistakes I made (so you don't)</h3>
+<ul>
+<li><strong>A missing <code>/CN=</code>.</strong> I typed <code>-subj "/C=CZ/ST=Prague/O=Homelab Intermediate CA"</code>, which turned the whole name into the organization and left no Common Name. Under <code>policy_strict</code> the root would have refused it. Re-creating the CSR fixed it; the key did not need to change.</li>
+<li><strong>A missing leading slash.</strong> <code>-subj "C=CZ/..."</code> fails with <em>subject name is expected to be in the format /type0=value0/...</em>.</li>
+<li><strong>Long one-line <code>sed</code> commands.</strong> A missing <code>;</code> breaks the whole expression. Five short <code>sed -i</code> lines are far easier to get right by hand.</li>
+<li><strong>A stray <code>privkey.pem</code>.</strong> An interrupted <code>openssl req -newkey</code> without <code>-keyout</code> writes its key to <code>privkey.pem</code> by default. Delete it so no orphaned key is left behind.</li>
+<li><strong>"bad decrypt ... maybe wrong password".</strong> Just a mistyped pass phrase; the key file is fine.</li>
+</ul>
+<h3>Automate it</h3>
+<p>I turned everything above into two scripts: one builds the whole hierarchy in a single command, the other starts a mutual-TLS server and shows a valid client getting in while the revoked one is turned away. They are on GitHub: <a href="https://github.com/miracaral/openssl-pki-homelab">github.com/miracaral/openssl-pki-homelab</a></p>
