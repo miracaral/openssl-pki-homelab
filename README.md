@@ -84,8 +84,8 @@ pki/            generated output (git-ignored, contains private keys)
 
 A step-by-step walkthrough of the manual commands behind these scripts:
 
-- Part 1: RSA key pair — *link*
-- Part 2: Root CA, chains, signing and revocation — *link*
+- [Part 1: RSA key pair](https://medium.com/@mmirac.aral/building-a-pki-with-openssl-part-1-rsa-key-pair-5a40c4c69cdd)
+- [Part 2: Root CA, chains, signing and revocation](https://medium.com/@mmirac.aral/building-a-pki-with-openssl-part-2-root-ca-chains-signing-and-revocation-a9a603d906f7)
 
 ## Disclaimer
 
